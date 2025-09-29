@@ -38,6 +38,44 @@ RESP_TIMEOUT = 60
 # when LIBP2P_DEBUG is set, otherwise will be disabled
 logger = logging.getLogger("libp2p.ping_test")
 
+# Configure logging to reduce debug output for QUIC tests
+def configure_logging():
+    """Configure logging to debug QUIC interop issues."""
+    # Set root logger to INFO level to see important messages
+    logging.getLogger().setLevel(logging.INFO)
+    
+    # Enable debug logging for QUIC-related modules to diagnose interop issues
+    logging.getLogger("libp2p.transport.quic").setLevel(logging.DEBUG)
+    logging.getLogger("libp2p.transport.quic.connection").setLevel(logging.DEBUG)
+    logging.getLogger("libp2p.transport.quic.transport").setLevel(logging.DEBUG)
+    logging.getLogger("libp2p.transport.quic.stream").setLevel(logging.DEBUG)
+    logging.getLogger("libp2p.transport.quic.config").setLevel(logging.DEBUG)
+    logging.getLogger("libp2p.network").setLevel(logging.DEBUG)
+    logging.getLogger("libp2p.host").setLevel(logging.DEBUG)
+    logging.getLogger("libp2p.peer").setLevel(logging.DEBUG)
+    logging.getLogger("libp2p.security").setLevel(logging.DEBUG)
+    logging.getLogger("libp2p.muxer").setLevel(logging.DEBUG)
+    logging.getLogger("libp2p.crypto").setLevel(logging.DEBUG)
+    
+    # Enable debug logging for aioquic to see QUIC protocol details
+    logging.getLogger("aioquic").setLevel(logging.DEBUG)
+    logging.getLogger("aioquic.quic").setLevel(logging.DEBUG)
+    logging.getLogger("aioquic.quic.connection").setLevel(logging.DEBUG)
+    logging.getLogger("aioquic.quic.events").setLevel(logging.DEBUG)
+    logging.getLogger("aioquic.quic.packet").setLevel(logging.DEBUG)
+    logging.getLogger("aioquic.quic.stream").setLevel(logging.DEBUG)
+    logging.getLogger("aioquic.quic.transport").setLevel(logging.DEBUG)
+    
+    # Keep our own logging at INFO level for important messages
+    logging.getLogger("libp2p.ping_test").setLevel(logging.INFO)
+    
+    # Suppress some noisy modules but keep QUIC debug
+    logging.getLogger("multiaddr").setLevel(logging.WARNING)
+    logging.getLogger("multiaddr.transforms").setLevel(logging.WARNING)
+    logging.getLogger("multiaddr.codecs").setLevel(logging.WARNING)
+    logging.getLogger("libp2p").setLevel(logging.WARNING)
+    logging.getLogger("libp2p.transport").setLevel(logging.WARNING)
+
 
 class PingTest:
     def __init__(self):
@@ -77,8 +115,8 @@ class PingTest:
     def validate_configuration(self) -> None:
         """Validate the configuration parameters."""
         # Validate transport
-        if self.transport not in ["tcp"]:
-            raise ValueError(f"Unsupported transport: {self.transport}. Supported transports: ['tcp']")
+        if self.transport not in ["tcp", "quic-v1"]:
+            raise ValueError(f"Unsupported transport: {self.transport}. Supported transports: ['tcp', 'quic-v1']")
         
         # Validate security
         if self.security not in ["noise", "plaintext"]:
@@ -123,26 +161,27 @@ class PingTest:
         else:
             raise ValueError(f"Unsupported muxer: {self.muxer}")
 
+
     async def handle_ping(self, stream: INetStream) -> None:
         """Handle incoming ping requests."""
-        while True:
-            try:
-                payload = await stream.read(PING_LENGTH)
-                # Get peer ID safely, suppressing warnings
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    try:
-                        peer_id = stream.muxed_conn.peer_id
-                    except (AttributeError, Exception):
-                        peer_id = "unknown"
-                if payload is not None:
-                    print(f"received ping from {peer_id}", file=sys.stderr)
-                    await stream.write(payload)
-                    print(f"responded with pong to {peer_id}", file=sys.stderr)
-            except Exception:
-                await stream.reset()
-                break
+        try:
+            # Only process one ping request to avoid excessive pong responses
+            payload = await stream.read(PING_LENGTH)
+            # Get peer ID safely, suppressing warnings
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                try:
+                    peer_id = stream.muxed_conn.peer_id
+                except (AttributeError, Exception):
+                    peer_id = "unknown"
+            if payload is not None:
+                print(f"received ping from {peer_id}", file=sys.stderr)
+                await stream.write(payload)
+                print(f"responded with pong to {peer_id}", file=sys.stderr)
+        except Exception as e:
+            print(f"Error in ping handler: {e}", file=sys.stderr)
+            await stream.reset()
 
     async def send_ping(self, stream: INetStream) -> float:
         """Send ping and measure RTT."""
@@ -174,6 +213,15 @@ class PingTest:
             print(f"error occurred: {e}", file=sys.stderr)
             raise
 
+    def create_listen_address(self, ip: str, port: int = 0) -> multiaddr.Multiaddr:
+        """Create listen address based on transport type."""
+        if self.transport == "tcp":
+            return multiaddr.Multiaddr(f"/ip4/{ip}/tcp/{port}")
+        elif self.transport == "quic-v1":
+            return multiaddr.Multiaddr(f"/ip4/{ip}/udp/{port}/quic-v1")
+        else:
+            raise ValueError(f"Unsupported transport for address creation: {self.transport}")
+
     async def run_listener(self) -> None:
         """Run the listener role."""
         logger.debug("Entering run_listener")
@@ -182,19 +230,37 @@ class PingTest:
         self.validate_configuration()
         # Create listen address
         logger.debug("Creating listen address")
-        listen_addr = multiaddr.Multiaddr(f"/ip4/{self.ip}/tcp/0")
+        listen_addr = self.create_listen_address(self.ip)
         # Create security and muxer options
         logger.debug("Creating security and muxer options")
         security_options, key_pair = self.create_security_options()
         muxer_options = self.create_muxer_options()
         # Create host with proper configuration
         logger.debug("Creating host")
-        self.host = new_host(
-            key_pair=key_pair,
-            sec_opt=security_options,
-            muxer_opt=muxer_options,
-            listen_addrs=[listen_addr]
-        )
+        enable_quic = self.transport == "quic-v1"
+        quic_config = None
+        if enable_quic:
+            from libp2p.transport.quic.config import QUICTransportConfig
+            quic_config = QUICTransportConfig()
+        
+        # For QUIC transport, don't use separate security options as QUIC has built-in TLS
+        if enable_quic:
+            self.host = new_host(
+                key_pair=key_pair,
+                muxer_opt=muxer_options,
+                listen_addrs=[listen_addr],
+                enable_quic=enable_quic,
+                quic_transport_opt=quic_config
+            )
+        else:
+            self.host = new_host(
+                key_pair=key_pair,
+                sec_opt=security_options,
+                muxer_opt=muxer_options,
+                listen_addrs=[listen_addr],
+                enable_quic=enable_quic,
+                quic_transport_opt=quic_config
+            )
         # Set up ping handler
         logger.debug("Setting stream handler")
         self.host.set_stream_handler(PING_PROTOCOL_ID, self.handle_ping)
@@ -207,17 +273,32 @@ class PingTest:
             if not listen_addrs:
                 raise RuntimeError("No listen addresses available")
             
-            # Replace 0.0.0.0 with the actual container IP
+            # Replace local IPs with the actual container IP for Docker networking
             actual_addr = None
+            logger.debug(f"Processing {len(listen_addrs)} listen addresses")
             for addr in listen_addrs:
-                if "/ip4/0.0.0.0/" in str(addr):
-                    # Replace 0.0.0.0 with the container's actual IP
+                addr_str = str(addr)
+                logger.debug(f"Checking address: {addr_str}")
+                
+                # Check for both 0.0.0.0 and 127.0.0.1 addresses that need replacement
+                if "/ip4/0.0.0.0/" in addr_str or "/ip4/127.0.0.1/" in addr_str:
+                    logger.debug(f"Found local address, replacing with container IP")
+                    # Get the container's actual IP
                     actual_ip = self.get_container_ip()
-                    actual_addr = str(addr).replace("/ip4/0.0.0.0/", f"/ip4/{actual_ip}/")
+                    logger.debug(f"Container IP: {actual_ip}")
+                    
+                    # Replace the IP in the address
+                    if "/ip4/0.0.0.0/" in addr_str:
+                        actual_addr = addr_str.replace("/ip4/0.0.0.0/", f"/ip4/{actual_ip}/")
+                    elif "/ip4/127.0.0.1/" in addr_str:
+                        actual_addr = addr_str.replace("/ip4/127.0.0.1/", f"/ip4/{actual_ip}/")
+                    
+                    logger.debug(f"Replaced address: {actual_addr}")
                     break
             
             if not actual_addr:
                 actual_addr = str(listen_addrs[0])
+                logger.debug(f"Using original address: {actual_addr}")
             
             logger.debug(f"Publishing address to Redis: {actual_addr}")
             self.redis_client.rpush("listenerAddr", actual_addr)
@@ -270,11 +351,28 @@ class PingTest:
             muxer_options = self.create_muxer_options()
             
             # Create host with proper configuration
-            self.host = new_host(
-                key_pair=key_pair,
-                sec_opt=security_options,
-                muxer_opt=muxer_options
-            )
+            enable_quic = self.transport == "quic-v1"
+            quic_config = None
+            if enable_quic:
+                from libp2p.transport.quic.config import QUICTransportConfig
+                quic_config = QUICTransportConfig()
+            
+            # For QUIC transport, don't use separate security options as QUIC has built-in TLS
+            if enable_quic:
+                self.host = new_host(
+                    key_pair=key_pair,
+                    muxer_opt=muxer_options,
+                    enable_quic=enable_quic,
+                    quic_transport_opt=quic_config
+                )
+            else:
+                self.host = new_host(
+                    key_pair=key_pair,
+                    sec_opt=security_options,
+                    muxer_opt=muxer_options,
+                    enable_quic=enable_quic,
+                    quic_transport_opt=quic_config
+                )
             
             # Start the host
             async with self.host.run(listen_addrs=[]):
@@ -358,12 +456,25 @@ class PingTest:
     def get_container_ip(self) -> str:
         """Get the container's actual IP address."""
         import socket
+        import subprocess
         try:
-            # Get the container's hostname and resolve it to IP
-            hostname = socket.gethostname()
-            ip = socket.gethostbyname(hostname)
-            logger.debug(f"Container IP: {ip} (hostname: {hostname})")
-            return ip
+            # Try multiple methods to get the container IP
+            # Method 1: Use hostname -I (works in most Docker containers)
+            try:
+                result = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0 and result.stdout.strip():
+                    ip = result.stdout.strip().split()[0]
+                    logger.debug(f"Container IP from hostname -I: {ip}")
+                    return ip
+            except Exception as e:
+                logger.debug(f"hostname -I failed: {e}")
+            
+            # Method 2: Connect to a remote address to determine our local IP
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                logger.debug(f"Container IP from socket: {local_ip}")
+                return local_ip
         except Exception as e:
             logger.debug(f"Failed to get container IP: {e}")
             # Fallback to a reasonable default
@@ -372,9 +483,12 @@ class PingTest:
 
 async def main():
     """Main entry point."""
+    # Configure logging to reduce debug output
+    configure_logging()
+    
     ping_test = PingTest()
     await ping_test.run()
 
 
 if __name__ == "__main__":
-    trio.run(main) 
+    trio.run(main)
