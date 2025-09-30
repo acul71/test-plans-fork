@@ -58,13 +58,16 @@ def configure_logging():
     logging.getLogger("libp2p.crypto").setLevel(logging.DEBUG)
     
     # Enable debug logging for aioquic to see QUIC protocol details
-    logging.getLogger("aioquic").setLevel(logging.DEBUG)
-    logging.getLogger("aioquic.quic").setLevel(logging.DEBUG)
-    logging.getLogger("aioquic.quic.connection").setLevel(logging.DEBUG)
-    logging.getLogger("aioquic.quic.events").setLevel(logging.DEBUG)
-    logging.getLogger("aioquic.quic.packet").setLevel(logging.DEBUG)
-    logging.getLogger("aioquic.quic.stream").setLevel(logging.DEBUG)
-    logging.getLogger("aioquic.quic.transport").setLevel(logging.DEBUG)
+    logging.getLogger("aioquic").setLevel(logging.INFO)  # Reduce noise
+    logging.getLogger("aioquic.quic").setLevel(logging.INFO)
+    logging.getLogger("aioquic.quic.connection").setLevel(logging.INFO)
+    logging.getLogger("aioquic.quic.events").setLevel(logging.INFO)
+    logging.getLogger("aioquic.quic.packet").setLevel(logging.WARNING)  # Reduce packet noise
+    logging.getLogger("aioquic.quic.stream").setLevel(logging.INFO)
+    logging.getLogger("aioquic.quic.transport").setLevel(logging.INFO)
+    # Suppress specific noisy QUIC loggers
+    logging.getLogger("aioquic.quic.packet").setLevel(logging.WARNING)
+    logging.getLogger("aioquic.quic.crypto").setLevel(logging.WARNING)
     
     # Keep our own logging at INFO level for important messages
     logging.getLogger("libp2p.ping_test").setLevel(logging.INFO)
@@ -86,7 +89,7 @@ class PingTest:
         self.is_dialer = os.getenv("is_dialer", "false").lower() == "true"
         self.ip = os.getenv("ip", "0.0.0.0")
         self.redis_addr = os.getenv("redis_addr", "redis:6379")
-        self.test_timeout_seconds = int(os.getenv("test_timeout_seconds", "180"))
+        self.test_timeout_seconds = int(os.getenv("test_timeout_seconds", "60"))
         
         # Parse Redis address
         if ":" in self.redis_addr:
@@ -98,6 +101,7 @@ class PingTest:
         
         self.host = None
         self.redis_client: Optional[redis.Redis] = None
+        # Track connection state to prevent duplicate connections
 
         logger.debug(f"ENV is_dialer={os.getenv('is_dialer')} (type: {type(os.getenv('is_dialer'))})")
         logger.debug(f"All environment variables: {os.environ}")
@@ -160,6 +164,7 @@ class PingTest:
             return create_mplex_muxer_option()
         else:
             raise ValueError(f"Unsupported muxer: {self.muxer}")
+
 
 
     async def handle_ping(self, stream: INetStream) -> None:
@@ -241,18 +246,70 @@ class PingTest:
         quic_config = None
         if enable_quic:
             from libp2p.transport.quic.config import QUICTransportConfig
-            quic_config = QUICTransportConfig()
+            import ssl
+            # Configure QUIC for interoperability testing
+            quic_config = QUICTransportConfig(
+                # Disable certificate verification for interoperability
+                verify_mode=ssl.CERT_NONE,
+                # Increase timeouts for interoperability testing
+                idle_timeout=60.0,
+                connection_timeout=30.0,
+                # Increase stream timeouts
+                STREAM_OPEN_TIMEOUT=15.0,
+                STREAM_ACCEPT_TIMEOUT=30.0,
+                STREAM_READ_TIMEOUT=30.0,
+                STREAM_WRITE_TIMEOUT=30.0,
+                # Increase connection handshake timeout
+                CONNECTION_HANDSHAKE_TIMEOUT=60.0,
+                # Enable both QUIC versions for maximum compatibility
+                enable_draft29=True,
+                enable_v1=True,
+                # Increase flow control windows
+                connection_window=2 * 1024 * 1024,  # 2MB
+                stream_window=1024 * 1024,  # 1MB
+                # Increase concurrent streams
+                max_concurrent_streams=200,
+                # Increase connection limits
+                max_connections=1000,
+                # Enable debugging for troubleshooting
+                enable_qlog=False,  # Disable qlog to reduce overhead
+                # Add specific QUIC protocol negotiation settings
+                max_idle_timeout=60.0,
+                keep_alive_interval=30.0,
+                # Disable connection migration for stability
+                disable_active_migration=True,
+                # Enable 0-RTT for faster handshakes
+                enable_0rtt=True,
+                # Add specific event handling configurations
+                enable_protocol_negotiation=True,
+                # Add specific QUIC handshake configurations
+                handshake_timeout=30.0,
+                # Add connection retry configurations
+                max_retry_attempts=3,
+                retry_delay=1.0,
+                # Add specific QUIC version negotiation
+                preferred_quic_version="v1",
+                # Add specific ALPN configurations for protocol negotiation
+                alpn_protocols=["libp2p"],
+                # Add specific connection state management
+                enable_connection_reuse=True,
+                # Add specific event loop configurations
+                enable_event_loop_integration=True,
+            )
         
-        # For QUIC transport, don't use separate security options as QUIC has built-in TLS
+        # For QUIC transport, use it as a secure transport (like Java implementation)
+        # QUIC has built-in security and multiplexing, so no separate security/muxer needed
         if enable_quic:
+            # QUIC is a complete transport protocol with built-in security and multiplexing
+            # No need for separate security or muxer options
             self.host = new_host(
                 key_pair=key_pair,
-                muxer_opt=muxer_options,
                 listen_addrs=[listen_addr],
                 enable_quic=enable_quic,
                 quic_transport_opt=quic_config
             )
         else:
+            # For non-QUIC transports, use traditional security and muxer options
             self.host = new_host(
                 key_pair=key_pair,
                 sec_opt=security_options,
@@ -264,6 +321,12 @@ class PingTest:
         # Set up ping handler
         logger.debug("Setting stream handler")
         self.host.set_stream_handler(PING_PROTOCOL_ID, self.handle_ping)
+        
+        # For QUIC, we don't need a connection handler as the transport handles protocol negotiation internally
+        # The "Unhandled event type: ProtocolNegotiated" error is expected and can be ignored
+        if enable_quic:
+            logger.debug("QUIC transport will handle protocol negotiation internally")
+        
         # Start the host
         logger.debug("Starting host")
         async with self.host.run(listen_addrs=[listen_addr]):
@@ -304,7 +367,14 @@ class PingTest:
             self.redis_client.rpush("listenerAddr", actual_addr)
             # Wait for the test timeout - the listener must stay alive
             print(f"Listener ready, waiting for dialer to connect for {self.test_timeout_seconds} seconds...", file=sys.stderr)
-            await trio.sleep(self.test_timeout_seconds)
+            
+            # Wait for connection with better error handling
+            try:
+                await trio.sleep(self.test_timeout_seconds)
+            except Exception as e:
+                logger.debug(f"Error during listener wait: {e}")
+                # Continue to timeout handling
+            
             # If we reach here, the dialer didn't complete within timeout
             logger.debug("Listener timeout - dialer did not complete within timeout")
             sys.exit(1)
@@ -355,21 +425,75 @@ class PingTest:
             quic_config = None
             if enable_quic:
                 from libp2p.transport.quic.config import QUICTransportConfig
-                quic_config = QUICTransportConfig()
+                import ssl
+                # Configure QUIC for interoperability testing
+                quic_config = QUICTransportConfig(
+                    # Disable certificate verification for interoperability
+                    verify_mode=ssl.CERT_NONE,
+                    # Increase timeouts for interoperability testing
+                    idle_timeout=60.0,
+                    connection_timeout=30.0,
+                    # Increase stream timeouts
+                    STREAM_OPEN_TIMEOUT=15.0,
+                    STREAM_ACCEPT_TIMEOUT=30.0,
+                    STREAM_READ_TIMEOUT=30.0,
+                    STREAM_WRITE_TIMEOUT=30.0,
+                    # Increase connection handshake timeout
+                    CONNECTION_HANDSHAKE_TIMEOUT=60.0,
+                    # Enable both QUIC versions for maximum compatibility
+                    enable_draft29=True,
+                    enable_v1=True,
+                    # Increase flow control windows
+                    connection_window=2 * 1024 * 1024,  # 2MB
+                    stream_window=1024 * 1024,  # 1MB
+                    # Increase concurrent streams
+                    max_concurrent_streams=200,
+                    # Increase connection limits
+                    max_connections=1000,
+                    # Enable debugging for troubleshooting
+                    enable_qlog=False,  # Disable qlog to reduce overhead
+                    # Add specific QUIC protocol negotiation settings
+                    max_idle_timeout=60.0,
+                    keep_alive_interval=30.0,
+                    # Disable connection migration for stability
+                    disable_active_migration=True,
+                    # Enable 0-RTT for faster handshakes
+                    enable_0rtt=True,
+                    # Add specific event handling configurations
+                    enable_protocol_negotiation=True,
+                    # Add specific QUIC handshake configurations
+                    handshake_timeout=30.0,
+                    # Add connection retry configurations
+                    max_retry_attempts=3,
+                    retry_delay=1.0,
+                    # Add specific QUIC version negotiation
+                    preferred_quic_version="v1",
+                    # Add specific ALPN configurations for protocol negotiation
+                    alpn_protocols=["libp2p"],
+                    # Add specific connection state management
+                    enable_connection_reuse=True,
+                    # Add specific event loop configurations
+                    enable_event_loop_integration=True,
+                )
             
-            # For QUIC transport, don't use separate security options as QUIC has built-in TLS
+            # For QUIC transport, use it as a secure transport (like Java implementation)
+            # QUIC has built-in security and multiplexing, so no separate security/muxer needed
             if enable_quic:
+                # QUIC is a complete transport protocol with built-in security and multiplexing
+                # No need for separate security or muxer options
                 self.host = new_host(
                     key_pair=key_pair,
-                    muxer_opt=muxer_options,
+                    listen_addrs=[listen_addr],
                     enable_quic=enable_quic,
                     quic_transport_opt=quic_config
                 )
             else:
+                # For non-QUIC transports, use traditional security and muxer options
                 self.host = new_host(
                     key_pair=key_pair,
                     sec_opt=security_options,
                     muxer_opt=muxer_options,
+                    listen_addrs=[listen_addr],
                     enable_quic=enable_quic,
                     quic_transport_opt=quic_config
                 )

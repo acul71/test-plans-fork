@@ -2,7 +2,7 @@
   {
     "id": "python-v0.2.9",
     "transports": [
-      "tcp"
+      "quic-v1"
     ],
     "secureChannels": [
       "noise",
