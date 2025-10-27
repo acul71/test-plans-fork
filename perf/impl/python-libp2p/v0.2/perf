@@ -1,0 +1,2 @@
+#!/bin/bash
+docker run --rm -e LIBP2P_DEBUG -v "$(dirname $0):/usr/src/myapp" -w /usr/src/myapp python-libp2p-perf:latest python3 perf.py "$@"

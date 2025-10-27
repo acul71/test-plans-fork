@@ -1,0 +1,167 @@
+# Python libp2p Perf Implementation
+
+This directory contains the Python implementation of the libp2p perf protocol for performance benchmarking.
+
+## Overview
+
+The Python implementation follows the libp2p perf protocol specification (`/perf/1.0.0`) and provides:
+- Support for TCP transport
+- Support for Noise security protocol
+- Support for Yamux multiplexer
+- Both server and client modes
+- Bidirectional data transfer with progress reporting
+- JSON output format for test results
+
+## Protocol Support
+
+| Protocol Type | Supported Values | Notes |
+|---------------|------------------|-------|
+| **Transports** | `tcp` | TCP transport only |
+| **Security** | `noise` | Noise security protocol |
+| **Muxers** | `yamux` | Yamux multiplexer |
+
+## Files
+
+- `perf.py` - Main implementation of the perf protocol
+- `pyproject.toml` - Python project configuration and dependencies
+- `Makefile` - Build configuration
+- `README.md` - This file
+
+## Building
+
+To build the perf executable:
+
+```bash
+make
+```
+
+This will:
+1. Install py-libp2p from the specified git commit
+2. Create a standalone `perf` executable
+3. Install all necessary dependencies
+
+### Build Options
+
+```bash
+# Build the perf executable
+make all
+
+# Clean build artifacts
+make clean
+```
+
+## Usage
+
+### Server Mode
+```bash
+./perf --run-server --server-address 0.0.0.0:4001
+```
+
+### Client Mode
+```bash
+./perf --server-address <IP>:4001 --transport tcp --upload-bytes <N> --download-bytes <N>
+```
+
+## Command Line Arguments
+
+- `--run-server`: Run as server (listens forever)
+- `--server-address`: Server address in format `host:port`
+- `--transport`: Transport protocol (`tcp` or `quic-v1`)
+- `--upload-bytes`: Number of bytes to upload per stream
+- `--download-bytes`: Number of bytes to download per stream
+
+## Output Format
+
+The implementation outputs JSON to stdout with the following format:
+
+**Progress Reports (every second):**
+```json
+{
+  "type": "intermediary",
+  "timeSeconds": 1.004957645,
+  "uploadBytes": 73039872,
+  "downloadBytes": 0
+}
+```
+
+**Final Results:**
+```json
+{
+  "type": "final",
+  "timeSeconds": 60.127230659,
+  "uploadBytes": 4382392320,
+  "downloadBytes": 0
+}
+```
+
+All diagnostic output goes to stderr.
+
+## Dependencies
+
+### Python Dependencies
+- `libp2p` - Python libp2p implementation (from git commit)
+- `typing-extensions` - Type hints support
+
+**Note:** `trio` and `multiaddr` are transitive dependencies included with `libp2p`.
+
+### System Dependencies
+The Docker build includes the following system packages:
+- `build-essential` - C/C++ compiler and build tools
+- `cmake` - Build system generator
+- `pkg-config` - Package configuration utility
+- `libgmp-dev` - GNU Multiple Precision Arithmetic Library
+- `git` - Required for installing py-libp2p from git repository
+
+## Implementation Details
+
+### Protocol Flow
+1. **Client initiates connection** to server using libp2p
+2. **Client opens stream** with protocol ID `/perf/1.0.0`
+3. **Client sends 8-byte header** indicating how many bytes server should send back
+4. **Client sends upload data** (if specified) with progress reporting
+5. **Server receives upload data** and drains the stream
+6. **Server sends download data** (if specified) back to client
+7. **Client receives download data** with progress reporting
+8. **Connection closes** and final measurements are reported
+
+### Performance Characteristics
+- **Block Size**: 64KB blocks for efficient I/O
+- **Progress Reporting**: Every 1 second during transfers
+- **Memory Usage**: Efficient streaming with minimal memory footprint
+- **Concurrency**: Uses trio for async/await patterns
+
+## Testing
+
+### Local Testing
+1. Start server:
+```bash
+./perf --run-server --server-address 0.0.0.0:4001
+```
+
+2. Run client test:
+```bash
+./perf --server-address localhost:4001 --transport tcp --upload-bytes 1000000 --download-bytes 1000000
+```
+
+### Integration Testing
+The implementation integrates with the perf benchmarking framework:
+- Server runs continuously until killed
+- Client performs specified data transfer
+- Results are collected by the test runner
+- JSON output is parsed for performance metrics
+
+## Limitations
+
+- **Transport Support**: Currently only supports TCP (QUIC support planned)
+- **Security**: Only Noise security protocol supported
+- **Muxer**: Only Yamux multiplexer supported
+- **Peer Discovery**: Uses hardcoded peer ID for testing
+
+## Future Enhancements
+
+- Add QUIC transport support
+- Add Plaintext security option
+- Add Mplex multiplexer support
+- Implement proper peer discovery
+- Add more comprehensive error handling
+- Optimize for higher throughput scenarios

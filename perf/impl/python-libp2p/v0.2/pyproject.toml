@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-libp2p-perf"
+version = "0.2.0"
+description = "Python libp2p perf implementation for performance benchmarking"
+authors = [
+    {name = "libp2p", email = "team@libp2p.io"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "libp2p @ git+https://github.com/libp2p/py-libp2p.git@5b94fdecc124b88fdda08f4427830a70dcb388fe",
+    "typing-extensions>=4.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["perf*"]

@@ -43,5 +43,12 @@
     "transportStacks": [
       "tcp"
     ]
+  },
+  {
+    "id": "v0.2",
+    "implementation": "python-libp2p",
+    "transportStacks": [
+      "tcp"
+    ]
   }
 ]

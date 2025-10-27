@@ -1,0 +1,2 @@
+libp2p@ git+https://github.com/libp2p/py-libp2p.git@f13876a64f5daeaec45c0e4e1ac0ca7741df60e4
+typing-extensions>=4.0.0
