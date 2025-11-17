@@ -14,6 +14,8 @@ import json
 import logging
 import os
 import sys
+import ssl
+import ipaddress
 import time
 from typing import Optional
 
@@ -88,7 +90,7 @@ class PingTest:
 
     def validate_configuration(self) -> None:
         """Validate configuration parameters."""
-        valid_transports = ["tcp", "ws", "quic-v1"]
+        valid_transports = ["tcp", "ws", "wss", "quic-v1"]
         valid_security = ["noise", "plaintext"]
         valid_muxers = ["mplex", "yamux"]
         
@@ -130,6 +132,102 @@ class PingTest:
         else:
             raise ValueError(f"Unsupported muxer: {self.muxer}")
 
+    def create_tls_config(self):
+        """Create TLS configuration for WSS transport."""
+        if self.transport != "wss":
+            return None, None
+        
+        # Create a TLS context that doesn't verify certificates (for testing)
+        # Similar to JS implementation: NODE_TLS_REJECT_UNAUTHORIZED = '0'
+        client_context = ssl.create_default_context()
+        client_context.check_hostname = False
+        client_context.verify_mode = ssl.CERT_NONE
+        
+        server_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        server_context.check_hostname = False
+        server_context.verify_mode = ssl.CERT_NONE
+        
+        # Generate a self-signed certificate for the server
+        # For testing purposes, we'll use a simple approach
+        # In production, proper certificates should be used
+        try:
+            from cryptography import x509
+            from cryptography.x509.oid import NameOID
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from datetime import datetime, timedelta
+            
+            # Generate a private key
+            private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+            
+            # Create a self-signed certificate
+            subject = issuer = x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+                x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "Test"),
+                x509.NameAttribute(NameOID.LOCALITY_NAME, "Test"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Test"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+            ])
+            
+            cert = x509.CertificateBuilder().subject_name(
+                subject
+            ).issuer_name(
+                issuer
+            ).public_key(
+                private_key.public_key()
+            ).serial_number(
+                x509.random_serial_number()
+            ).not_valid_before(
+                datetime.utcnow()
+            ).not_valid_after(
+                datetime.utcnow() + timedelta(days=365)
+            ).add_extension(
+                x509.SubjectAlternativeName([
+                    x509.DNSName("localhost"),
+                    x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                ]),
+                critical=False,
+            ).sign(private_key, hashes.SHA256())
+            
+            # Load certificate and key into SSL context
+            # We need to convert to PEM format
+            cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+            key_pem = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            )
+            
+            # Use load_cert_chain with bytes (requires Python 3.7+)
+            # For older Python, we might need to write to temp files
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='wb', delete=False) as cert_file:
+                cert_file.write(cert_pem)
+                cert_path = cert_file.name
+            with tempfile.NamedTemporaryFile(mode='wb', delete=False) as key_file:
+                key_file.write(key_pem)
+                key_path = key_file.name
+            
+            try:
+                server_context.load_cert_chain(cert_path, key_path)
+            finally:
+                # Clean up temp files
+                try:
+                    os.unlink(cert_path)
+                    os.unlink(key_path)
+                except Exception:
+                    pass
+        except ImportError:
+            # If cryptography is not available, use a minimal approach
+            # This will work for dialing but may fail for listening
+            # In that case, we'll let the error surface
+            pass
+        
+        return client_context, server_context
+
     def _get_ip_value(self, addr) -> Optional[str]:
         """Extract IP value from multiaddr (IPv4 or IPv6)."""
         return addr.value_for_protocol("ip4") or addr.value_for_protocol("ip6")
@@ -167,12 +265,14 @@ class PingTest:
                     print(f"Error converting address {addr} to QUIC: {e}", file=sys.stderr)
             return quic_addrs if quic_addrs else [self._build_quic_addr("0.0.0.0", port)]
         
-        elif self.transport == "ws":
-            # Add /ws protocol to TCP addresses
+        elif self.transport in ["ws", "wss"]:
+            # Add /ws or /wss protocol to TCP addresses
+            ws_protocol = "/wss" if self.transport == "wss" else "/ws"
             ws_addrs = []
             for addr in base_addrs:
                 try:
                     protocols = self._get_protocol_names(addr)
+                    # Accept addresses that already have ws or wss
                     if "ws" in protocols or "wss" in protocols:
                         ws_addrs.append(addr)
                     else:
@@ -182,13 +282,14 @@ class PingTest:
                             p2p_value = addr.value_for_protocol("p2p")
                             if p2p_value:
                                 addr = addr.decapsulate(multiaddr.Multiaddr(f"/p2p/{p2p_value}"))
-                        ws_addr = addr.encapsulate(multiaddr.Multiaddr("/ws"))
+                        ws_addr = addr.encapsulate(multiaddr.Multiaddr(ws_protocol))
                         if p2p_value:
                             ws_addr = ws_addr.encapsulate(multiaddr.Multiaddr(f"/p2p/{p2p_value}"))
                         ws_addrs.append(ws_addr)
                 except Exception as e:
                     print(f"Error converting address {addr} to WebSocket: {e}", file=sys.stderr)
-            return ws_addrs if ws_addrs else [multiaddr.Multiaddr(f"/ip4/0.0.0.0/tcp/{port}/ws")]
+            default_protocol = "/wss" if self.transport == "wss" else "/ws"
+            return ws_addrs if ws_addrs else [multiaddr.Multiaddr(f"/ip4/0.0.0.0/tcp/{port}{default_protocol}")]
         
         return base_addrs
 
@@ -263,6 +364,8 @@ class PingTest:
             protocols = self._get_protocol_names(addr)
             if self.transport == "ws" and ("ws" in protocols or "wss" in protocols):
                 filtered.append(addr)
+            elif self.transport == "wss" and ("ws" in protocols or "wss" in protocols):
+                filtered.append(addr)
             elif self.transport == "quic-v1" and "quic-v1" in protocols:
                 filtered.append(addr)
             elif self.transport == "tcp" and not any(p in protocols for p in ["ws", "wss", "quic-v1"]):
@@ -326,12 +429,17 @@ class PingTest:
         # This converts TCP addresses to QUIC addresses when transport is "quic-v1"
         listen_addrs = self.create_listen_addresses(0)
         
+        # Create TLS configuration for WSS
+        tls_client_config, tls_server_config = self.create_tls_config()
+        
         self.host = new_host(
             key_pair=key_pair,
             sec_opt=sec_opt,
             muxer_opt=muxer_opt,
             listen_addrs=listen_addrs,
-            enable_quic=(self.transport == "quic-v1")
+            enable_quic=(self.transport == "quic-v1"),
+            tls_client_config=tls_client_config,
+            tls_server_config=tls_server_config
         )
         self.host.set_stream_handler(PING_PROTOCOL_ID, self.handle_ping)
         self.log_protocols()
@@ -441,17 +549,27 @@ class PingTest:
             sec_opt, key_pair = self.create_security_options()
             muxer_opt = self.create_muxer_options()
             
-            # WS dialer workaround: need listen addresses to register transport (py-libp2p limitation)
-            dialer_listen_addrs = self.create_listen_addresses(0) if self.transport == "ws" else None
+            # Create TLS configuration for WSS
+            tls_client_config, tls_server_config = self.create_tls_config()
+            if tls_client_config:
+                print(f"[DEBUG] TLS client config created: verify_mode={tls_client_config.verify_mode}, check_hostname={tls_client_config.check_hostname}", file=sys.stderr)
+            else:
+                print(f"[DEBUG] No TLS client config created (transport={self.transport})", file=sys.stderr)
+            
+            # WS/WSS dialer workaround: need listen addresses to register transport (py-libp2p limitation)
+            dialer_listen_addrs = self.create_listen_addresses(0) if self.transport in ["ws", "wss"] else None
             if dialer_listen_addrs:
-                print(f"Registering WS transport for dialer with addresses: {[str(addr) for addr in dialer_listen_addrs]}", file=sys.stderr)
+                print(f"Registering {self.transport.upper()} transport for dialer with addresses: {[str(addr) for addr in dialer_listen_addrs]}", file=sys.stderr)
             
             host_kwargs = {
                 "key_pair": key_pair,
                 "sec_opt": sec_opt,
                 "muxer_opt": muxer_opt,
-                "enable_quic": (self.transport == "quic-v1")
+                "enable_quic": (self.transport == "quic-v1"),
+                "tls_client_config": tls_client_config,
+                "tls_server_config": tls_server_config
             }
+            print(f"[DEBUG] Passing TLS config to new_host: client={tls_client_config is not None}, server={tls_server_config is not None}", file=sys.stderr)
             if dialer_listen_addrs:
                 host_kwargs["listen_addrs"] = dialer_listen_addrs
             
@@ -464,7 +582,15 @@ class PingTest:
                 
                 print(f"Connecting to {listener_addr}", file=sys.stderr)
                 print(f"[DEBUG] About to call host.connect() for {info.peer_id}", file=sys.stderr)
-                await self.host.connect(info)
+                print(f"[DEBUG] Listener address protocols: {[p.name for p in maddr.protocols()]}", file=sys.stderr)
+                try:
+                    await self.host.connect(info)
+                except Exception as e:
+                    print(f"[DEBUG] Connection error type: {type(e).__name__}", file=sys.stderr)
+                    print(f"[DEBUG] Connection error: {e}", file=sys.stderr)
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+                    raise
                 print("Connected successfully", file=sys.stderr)
                 print("[DEBUG] host.connect() completed, checking connection state", file=sys.stderr)
                 
